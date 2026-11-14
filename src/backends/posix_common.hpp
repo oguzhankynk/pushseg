@@ -31,11 +31,12 @@ extern "C" void __tsan_release(void* addr);  // NOLINT(bugprone-reserved-identif
 
 namespace pushseg::backends::posix {
 
-// mq_send() -> mq_receive() orders memory like any syscall pair, but
-// ThreadSanitizer does not intercept message queues (it does for sockets), so
-// it would report false races between a sender's writes and the receiver's
-// reads. Tell it about the edge. One token for all queues: coarser than the
-// truth, which can only hide races, never invent them. No-op without TSan.
+// mq_send() -> mq_receive(), and a send on a socket -> the receive on its
+// peer socket, order memory like any syscall pair, but ThreadSanitizer does
+// not see these edges (message queues are not intercepted; two connected
+// sockets are distinct objects to it), so it would report false races between
+// a sender's writes and the receiver's reads. Tell it about the edge. One token for all queues:
+// coarser than the truth, which can only hide races, never invent them. No-op without TSan.
 #ifdef PUSHSEG_TSAN
 inline char g_mq_sync_token;
 inline void mq_release() {

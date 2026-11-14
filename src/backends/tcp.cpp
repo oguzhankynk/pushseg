@@ -27,6 +27,8 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include "backends/posix_common.hpp"
+
 namespace pushseg::backends {
 namespace {
 
@@ -98,6 +100,9 @@ public:
       msghdr msg{};
       msg.msg_iov = v + idx;
       msg.msg_iovlen = cnt - idx;
+      // TSan does not connect a send on one socket with the receive on its
+      // peer socket; tell it (see posix_common.hpp).
+      posix::mq_release();
       const ssize_t n = ::sendmsg(fd_, &msg, MSG_NOSIGNAL);
       if (n < 0) {
         if (errno == EINTR) {
@@ -142,6 +147,7 @@ void reader_loop(const std::shared_ptr<TcpLink>& link, const std::shared_ptr<Lin
   Status why = Status::kDisconnected;
   while (true) {
     const ssize_t n = ::recv(link->fd(), buf.data(), buf.size(), 0);
+    posix::mq_acquire();
     if (n > 0) {
       h->on_recv(buf.data(), static_cast<std::size_t>(n));
       continue;

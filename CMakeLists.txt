@@ -5,7 +5,9 @@ project(pushseg
   DESCRIPTION "Segment-based push-only data transfer over pluggable transports"
   LANGUAGES CXX)
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+# PREPEND: when this project is a subproject (FetchContent, add_subdirectory),
+# its own modules must win over same-named modules of the parent project.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Build type" FORCE)
@@ -25,7 +27,14 @@ find_package(Doxygen QUIET)
 option(BUILD_SHARED_LIBS "Build pushseg as a shared library" OFF)
 option(PUSHSEG_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(PUSHSEG_BUILD_EXAMPLES "Build example programs" ${PROJECT_IS_TOP_LEVEL})
-option(PUSHSEG_BUILD_DOCS "Build the Doxygen API reference ('docs' / 'docs-check' targets)" ${DOXYGEN_FOUND})
+# Docs only for the top-level project: as a subproject, its "docs" targets
+# would clash with the parent's.
+if(PROJECT_IS_TOP_LEVEL AND DOXYGEN_FOUND)
+  set(_pushseg_docs_default ON)
+else()
+  set(_pushseg_docs_default OFF)
+endif()
+option(PUSHSEG_BUILD_DOCS "Build the Doxygen API reference ('docs' / 'docs-check' targets)" ${_pushseg_docs_default})
 option(PUSHSEG_ENABLE_CLANG_TIDY "Run clang-tidy on the pushseg target while building" OFF)
 option(PUSHSEG_ENABLE_CPPCHECK "Run cppcheck on the pushseg target while building" OFF)
 option(PUSHSEG_ENABLE_COVERAGE "Build pushseg and its tests with --coverage instrumentation" OFF)
