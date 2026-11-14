@@ -6,8 +6,8 @@ pushseg is a C++17 transport layer for sharing data between processes on
 different targets (machines). Applications see a single model: they **read
 their own segments through plain pointers** and **write into remote segments
 through one-way connections**. Whether the bytes travel over TCP, POSIX message
-queues, PCIe, or any other API is chosen per node pair in a config file, and
-the application code does not change.
+queues, POSIX shared memory, or another API plugged in as a backend is chosen
+per node pair in a config file, and the application code does not change.
 
 ```
    Node 1 (writer)                            Node 0 (owner)
@@ -85,7 +85,7 @@ algo = 1
 
 [node.0]
 tcp   = 10.0.0.10            # backend name = backend-specific address (opaque to the core)
-mypci = bus3:0
+mybus = dev0                 # a backend you registered yourself (see below)
 
 [node.1]
 tcp = 10.0.0.11:41000        # tcp: optional per-node base port
@@ -95,7 +95,7 @@ tcp = 10.0.0.12
 
 [links]
 default = tcp                # node pairs without an explicit entry
-0-1     = mypci              # 0 <-> 1 over PCIe, everything with node 2 over TCP
+0-1     = mybus              # 0 <-> 1 over your backend, everything with node 2 over TCP
 
 [backend.tcp]
 base_port = 40000            # port = base + app*32 + inst
@@ -107,6 +107,7 @@ base_port = 40000            # port = base + app*32 + inst
 |---|---|---|---|
 | `tcp` | Stream | Any hosts | One TCP connection per `Connection`. Address: `host[:base_port]`. |
 | `mq` | Stream | Same host | POSIX message queues. Address unused. |
+| `shm` | Mapped | Same host | POSIX shared memory: writers store straight into the owner's memory. Address unused. |
 | `loopmem` | Mapped | Same process | Reference for writing a mapped backend; used by the tests. |
 
 ### `mq` (POSIX message queues)
@@ -130,8 +131,30 @@ maxmsg      = 8              # messages per queue; <= /proc/sys/fs/mqueue/msg_ma
 - A process restarted with the same `(node, app, inst)` takes over the stale lock file
   and listener queue of a crashed predecessor.
 
-The backend is chosen **per node pair**. One segment can be written over PCIe
-and TCP at the same time (`MixedBackendTest` covers this).
+### `shm` (POSIX shared memory)
+
+```ini
+[links]
+default = shm                # all nodes run on the same machine
+
+[backend.shm]
+name_prefix  = /pushseg      # segments: <prefix>.s.<node>.<key>; event queues: <prefix>.e.<node>.<app>.<inst>
+lock_dir     = /dev/shm      # identity lock files: <lock_dir>/<prefix>.shm.<node>.<app>.<inst>.lock
+event_maxmsg = 8             # pending notifications per process
+```
+
+- The data path is a plain store into mapped memory: no copy, no system call.
+- Connect, disconnect and interrupt notifications go to the owner's POSIX message
+  queue; they are queued, so none is lost.
+- A destroyed segment or a dead owner (checked by pid) turns the writer's next
+  notification into `kDisconnected`. A writer that dies without releasing its
+  mapping is not reported to the owner.
+- A process restarted with the same `(node, app, inst)` removes the segments and the
+  event queue a crashed predecessor left.
+
+The backend is chosen **per node pair**. One segment can be written over a mapped
+backend and over TCP at the same time (`MixedBackendTest` covers this with the
+in-process reference backend).
 
 ## Plugging in your own API
 
@@ -140,7 +163,7 @@ and TCP at the same time (`MixedBackendTest` covers this).
 | Level | You implement | The core does | Example |
 |---|---|---|---|
 | **Stream** (`StreamBackend`) | connect, listen, `sendv`, deliver received bytes via `on_recv` | The whole segment protocol: framing, writes, atomic stores, notify, fences | `src/backends/tcp.cpp`, `src/backends/mq.cpp` |
-| **Mapped** (`MappedBackend`) | alloc/export/import, `store_barrier`, `interrupt`, optional DMA | `write` = memcpy/DMA, `store` = wait DMA + barrier + store + barrier, `notify` = barrier + interrupt | `src/backends/loopmem.cpp` |
+| **Mapped** (`MappedBackend`) | alloc/export/import, `store_barrier`, `interrupt`, optional DMA | `write` = memcpy/DMA, `store` = wait DMA + barrier + store + barrier, `notify` = barrier + interrupt | `src/backends/shm.cpp`, `src/backends/loopmem.cpp` |
 
 At both levels the **core** enforces the atomicity and ordering contract. A
 backend only moves bytes. Register it before creating a `pushseg::Context`:
@@ -148,10 +171,10 @@ backend only moves bytes. Register it before creating a `pushseg::Context`:
 ```cpp
 #include <pushseg/backend.hpp>
 
-class MyPciBackend final : public pushseg::backend::MappedBackend { /* ... */ };
+class MyBusBackend final : public pushseg::backend::MappedBackend { /* ... */ };
 
-pushseg::backend::register_mapped_backend("mypci", [] { return std::make_unique<MyPciBackend>(); });
-// config: [links] 0-1 = mypci
+pushseg::backend::register_mapped_backend("mybus", [] { return std::make_unique<MyBusBackend>(); });
+// config: [links] 0-1 = mybus
 ```
 
 To validate a backend, add its name to the `INSTANTIATE_TEST_SUITE_P` list in
@@ -198,6 +221,8 @@ src/core/
 src/backends/
   tcp.cpp         Built-in stream backend (TCP)
   mq.cpp          Built-in stream backend (POSIX message queues, same host)
+  shm.cpp         Built-in mapped backend (POSIX shared memory, same host)
+  posix_common.hpp  Identity lock and helpers shared by mq and shm
   loopmem.cpp     Built-in mapped backend (in-process; reference and tests)
 tests/unit/       Config, wire, API, and end-to-end contract tests
 examples/         pingpong + sample config

@@ -37,12 +37,14 @@ inline Config make_config(const std::string& default_backend) {
     cfg.nodes[n]["tcp"] = "127.0.0.1:" + std::to_string(tcp_base(n));
     cfg.nodes[n]["loopmem"] = "";
     cfg.nodes[n]["mq"] = "";
+    cfg.nodes[n]["shm"] = "";
   }
   // Per-process names so parallel test processes never share queues, and
   // small queues to stay under RLIMIT_MSGQUEUE with many tests in parallel.
   cfg.backend_options["mq"] = {{"name_prefix", "/pushseg-test-" + std::to_string(::getpid())},
                                {"msgsize", "2048"},
                                {"maxmsg", "4"}};
+  cfg.backend_options["shm"] = {{"name_prefix", "/pushseg-test-" + std::to_string(::getpid())}};
   cfg.default_backend = default_backend;
   return cfg;
 }

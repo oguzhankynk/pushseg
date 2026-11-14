@@ -14,6 +14,7 @@ add_library(pushseg
   core/mapped_conn.cpp
   backends/tcp.cpp
   backends/mq.cpp
+  backends/shm.cpp
   backends/loopmem.cpp
 )
 add_library(pushseg::pushseg ALIAS pushseg)
@@ -28,7 +29,7 @@ target_include_directories(pushseg
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# rt: POSIX message queues (a stub on glibc >= 2.34, needed on older ones).
+# rt: POSIX message queues and shared memory (a stub on glibc >= 2.34, needed on older ones).
 target_link_libraries(pushseg PUBLIC Threads::Threads rt)
 
 pushseg_set_warnings(pushseg)

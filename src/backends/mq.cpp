@@ -43,44 +43,22 @@
 #include <poll.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_THREAD__)
-#define PUSHSEG_TSAN 1
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define PUSHSEG_TSAN 1
-#endif
-#endif
-
-#ifdef PUSHSEG_TSAN
-extern "C" void __tsan_acquire(void* addr);  // NOLINT(bugprone-reserved-identifier)
-extern "C" void __tsan_release(void* addr);  // NOLINT(bugprone-reserved-identifier)
-#endif
+#include "backends/posix_common.hpp"
 
 namespace pushseg::backends {
 namespace {
-
-// mq_send() -> mq_receive() orders memory like any syscall pair, but
-// ThreadSanitizer does not intercept message queues (it does for sockets), so
-// it would report false races between a sender's writes and the receiver's
-// reads. Tell it about the edge. One token for all queues: coarser than the
-// truth, which can only hide races, never invent them. No-op without TSan.
-#ifdef PUSHSEG_TSAN
-char g_mq_sync_token;
-inline void mq_release() {
-  __tsan_release(&g_mq_sync_token);
-}
-inline void mq_acquire() {
-  __tsan_acquire(&g_mq_sync_token);
-}
-#else
-inline void mq_release() {}
-inline void mq_acquire() {}
-#endif
 
 using backend::Endpoint;
 using backend::Link;
 using backend::LinkHandler;
 using backend::Options;
+using posix::alive;
+using posix::deadline_in;
+using posix::identity;
+using posix::mq_acquire;
+using posix::mq_release;
+using posix::opt;
+using posix::opt_long;
 
 constexpr int kPollMs = 200;                     // peer liveness check period
 constexpr std::uint32_t kReqMagic = 0x50534D51;  // "QMSP"
@@ -94,33 +72,6 @@ struct ConnReq {
   char c2s[kNameMax] = {};
   char s2c[kNameMax] = {};
 };
-
-std::string opt(const Options& o, const char* key, const char* def) {
-  const auto it = o.find(key);
-  return it == o.end() ? std::string(def) : it->second;
-}
-
-long opt_long(const Options& o, const char* key, long def) {
-  const auto it = o.find(key);
-  return it == o.end() ? def : std::strtol(it->second.c_str(), nullptr, 10);
-}
-
-std::string identity(const Endpoint& e) {
-  return std::to_string(e.node) + "." + std::to_string(e.app) + "." + std::to_string(e.inst);
-}
-
-bool alive(pid_t pid) {
-  return pid <= 0 || ::kill(pid, 0) == 0 || errno == EPERM;
-}
-
-timespec deadline_in(int ms) {
-  timespec ts{};
-  ::clock_gettime(CLOCK_REALTIME, &ts);
-  ts.tv_nsec += static_cast<long>(ms % 1000) * 1000000L;
-  ts.tv_sec += ms / 1000 + ts.tv_nsec / 1000000000L;
-  ts.tv_nsec %= 1000000000L;
-  return ts;
-}
 
 std::size_t queue_msgsize(mqd_t q) {
   mq_attr a{};
@@ -318,21 +269,8 @@ public:
     }
 
     // Identity lock: fails while another live process holds it.
-    lock_path_ = lock_path(self);
-    lock_fd_ = ::open(lock_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (lock_fd_ < 0) {
-      return Status::kIoError;
-    }
-    if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-      ::close(lock_fd_);
-      lock_fd_ = -1;
-      return errno == EWOULDBLOCK ? Status::kExists : Status::kIoError;
-    }
-    const std::string pid = std::to_string(::getpid()) + "\n";
-    if (::ftruncate(lock_fd_, 0) != 0 ||
-        ::write(lock_fd_, pid.data(), pid.size()) != static_cast<ssize_t>(pid.size())) {
-      release_lock();
-      return Status::kIoError;
+    if (const Status st = lock_.acquire(lock_path(self)); st != Status::kOk) {
+      return st;
     }
 
     // Holding the lock, any existing listener queue is stale.
@@ -411,22 +349,7 @@ private:
   }
 
   pid_t read_owner_pid(const Endpoint& e) const {
-    const int fd = ::open(lock_path(e).c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-      return 0;
-    }
-    char buf[32] = {};
-    const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
-    ::close(fd);
-    return n > 0 ? static_cast<pid_t>(std::strtol(buf, nullptr, 10)) : 0;
-  }
-
-  void release_lock() {
-    if (lock_fd_ >= 0) {
-      ::unlink(lock_path_.c_str());  // while still holding the lock
-      ::close(lock_fd_);
-      lock_fd_ = -1;
-    }
+    return posix::read_pid(lock_path(e));
   }
 
   void accept_loop() {
@@ -520,17 +443,16 @@ private:
       ::close(wake_fd_);
       wake_fd_ = -1;
     }
-    release_lock();
+    lock_.release();
   }
 
   backend::StreamHost* host_ = nullptr;
   std::string prefix_;
   std::string lock_dir_;
-  std::string lock_path_;
   std::string listen_name_;
   long msgsize_ = 8192;
   long maxmsg_ = 8;
-  int lock_fd_ = -1;
+  posix::IdentityLock lock_;
   int wake_fd_ = -1;
   mqd_t listen_q_ = kBadMq;
   std::atomic<std::uint64_t> link_seq_{0};
