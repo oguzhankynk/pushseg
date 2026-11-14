@@ -8,6 +8,7 @@ namespace pushseg {
 namespace backends {
 // Built-in backends (src/backends/).
 std::unique_ptr<backend::StreamBackend> make_tcp_backend();
+std::unique_ptr<backend::StreamBackend> make_mq_backend();
 std::unique_ptr<backend::MappedBackend> make_loopmem_backend();
 }  // namespace backends
 
@@ -48,9 +49,10 @@ struct Registry {
 // Built-ins are registered on first use rather than by static initializers,
 // which the linker would drop from a static library.
 Registry& registry() {
-  static Registry* r = [] {
+  static Registry* const r = [] {
     auto* reg = new Registry();
     reg->streams["tcp"] = backends::make_tcp_backend;
+    reg->streams["mq"] = backends::make_mq_backend;
     reg->mapped["loopmem"] = backends::make_loopmem_backend;
     return reg;
   }();

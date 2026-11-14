@@ -28,7 +28,7 @@ public:
       : ctx_(std::move(ctx)), be_(be), dma_threshold_(dma_threshold) {}
 
   ~MappedConn() override {
-    disconnect();
+    close();
   }
 
   Status open(const backend::Endpoint& remote, SegKey key, Clock::time_point deadline) {
@@ -123,6 +123,11 @@ public:
   }
 
   void disconnect() override {
+    close();
+  }
+
+private:
+  void close() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!open_) {
       return;
@@ -132,7 +137,6 @@ public:
     be_.release_segment(seg_);
   }
 
-private:
   // Everything issued so far becomes visible before anything issued later.
   Status order_locked() {
     if (dma_pending_) {

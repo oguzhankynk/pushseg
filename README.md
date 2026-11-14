@@ -5,9 +5,9 @@
 pushseg is a C++17 transport layer for sharing data between processes on
 different targets (machines). Applications see a single model: they **read
 their own segments through plain pointers** and **write into remote segments
-through one-way connections**. Whether the bytes travel over TCP, PCIe, or any
-other API is chosen per node pair in a config file, and the application code
-does not change.
+through one-way connections**. Whether the bytes travel over TCP, POSIX message
+queues, PCIe, or any other API is chosen per node pair in a config file, and
+the application code does not change.
 
 ```
    Node 1 (writer)                            Node 0 (owner)
@@ -101,6 +101,35 @@ default = tcp                # node pairs without an explicit entry
 base_port = 40000            # port = base + app*32 + inst
 ```
 
+## Built-in backends
+
+| Name | Level | Scope | Notes |
+|---|---|---|---|
+| `tcp` | Stream | Any hosts | One TCP connection per `Connection`. Address: `host[:base_port]`. |
+| `mq` | Stream | Same host | POSIX message queues. Address unused. |
+| `loopmem` | Mapped | Same process | Reference for writing a mapped backend; used by the tests. |
+
+### `mq` (POSIX message queues)
+
+```ini
+[links]
+0-1 = mq                     # nodes 0 and 1 run on the same machine
+
+[backend.mq]
+name_prefix = /pushseg       # queue names: <prefix>.<node>.<app>.<inst>, <prefix>.l<pid>.<n>.c2s/.s2c
+lock_dir    = /dev/shm       # identity lock files: <lock_dir>/<prefix>.<node>.<app>.<inst>.lock
+msgsize     = 8192           # bytes per message; <= /proc/sys/fs/mqueue/msgsize_max
+maxmsg      = 8              # messages per queue; <= /proc/sys/fs/mqueue/msg_max
+```
+
+- Each link uses two queues, about `2 * maxmsg * msgsize` bytes of kernel memory. The
+  per-user limit `ulimit -q` (often 800 KiB) therefore caps the number of open links:
+  about 6 with the defaults. Lower `msgsize`/`maxmsg` or raise the limit for more.
+- Message queues do not report a vanished peer. The backend reads the peer's pid from
+  its lock file and checks it periodically, so a killed peer is detected within ~200 ms.
+- A process restarted with the same `(node, app, inst)` takes over the stale lock file
+  and listener queue of a crashed predecessor.
+
 The backend is chosen **per node pair**. One segment can be written over PCIe
 and TCP at the same time (`MixedBackendTest` covers this).
 
@@ -110,7 +139,7 @@ and TCP at the same time (`MixedBackendTest` covers this).
 
 | Level | You implement | The core does | Example |
 |---|---|---|---|
-| **Stream** (`StreamBackend`) | connect, listen, `sendv`, deliver received bytes via `on_recv` | The whole segment protocol: framing, writes, atomic stores, notify, fences | `src/backends/tcp.cpp` |
+| **Stream** (`StreamBackend`) | connect, listen, `sendv`, deliver received bytes via `on_recv` | The whole segment protocol: framing, writes, atomic stores, notify, fences | `src/backends/tcp.cpp`, `src/backends/mq.cpp` |
 | **Mapped** (`MappedBackend`) | alloc/export/import, `store_barrier`, `interrupt`, optional DMA | `write` = memcpy/DMA, `store` = wait DMA + barrier + store + barrier, `notify` = barrier + interrupt | `src/backends/loopmem.cpp` |
 
 At both levels the **core** enforces the atomicity and ordering contract. A
@@ -140,6 +169,9 @@ cmake --preset tsan  && cmake --build --preset tsan  && ctest --preset tsan   # 
 The `tsan` preset uses clang because GCC 11's libtsan does not intercept
 `pthread_cond_clockwait` and reports false "double lock" errors.
 
+Coverage counts only real branches (`--exclude-throw-branches`): every call that
+may throw adds a hidden exception edge that tests cannot target.
+
 Requirements: Linux x86_64, a C++17 compiler (GCC 11+ / Clang 14+), CMake 3.25+, Ninja.
 Tests fetch GoogleTest via `FetchContent`.
 
@@ -164,15 +196,16 @@ src/core/
   stream_inbound.cpp  Owner side: applies frames to the segment
   mapped_conn.cpp     Mapped level: turns the contract into barriers, DMA, interrupts
 src/backends/
-  tcp.cpp         Built-in stream backend
+  tcp.cpp         Built-in stream backend (TCP)
+  mq.cpp          Built-in stream backend (POSIX message queues, same host)
   loopmem.cpp     Built-in mapped backend (in-process; reference and tests)
-tests/unit/       Config, wire, and end-to-end contract tests
+tests/unit/       Config, wire, API, and end-to-end contract tests
 examples/         pingpong + sample config
 ```
 
 ## Known limits and next steps
 
-- The TCP backend uses one reader thread per link. Fine for tens of links; an epoll loop can replace it behind the same SPI.
+- The TCP and mq backends use one reader thread per link. Fine for tens of links; an epoll loop can replace it behind the same SPI.
 - No TCP heartbeat. Disconnects are detected through TCP keepalive and socket errors.
 - Mapped-level DMA writes currently wait synchronously. An async `write` API could defer the wait to the next ordering point.
 - No remote read-modify-write atomics (`fetch_add`, CAS). Use one slot per writer for multi-writer counters.

@@ -60,7 +60,9 @@ class LocalSegment {
 public:
   LocalSegment() = default;
   ~LocalSegment();
-  LocalSegment(LocalSegment&&) noexcept = default;
+  /// @brief Move-constructs; the source becomes empty.
+  /// @param other Source.
+  LocalSegment(LocalSegment&& other) noexcept = default;
   /// @brief Move-assigns; destroys the currently held segment first.
   /// @param other Source.
   /// @return *this.
@@ -127,7 +129,9 @@ class Connection {
 public:
   Connection() = default;
   ~Connection();
-  Connection(Connection&&) noexcept = default;
+  /// @brief Move-constructs; the source becomes empty.
+  /// @param other Source.
+  Connection(Connection&& other) noexcept = default;
   /// @brief Move-assigns; disconnects the currently held connection first.
   /// @param other Source.
   /// @return *this.
@@ -210,7 +214,9 @@ public:
   /// @param inst Instance number of this application on this node.
   Context(const Config& cfg, NodeId node, const std::string& app, InstId inst = 0);
   ~Context();
-  Context(Context&&) noexcept = default;
+  /// @brief Move-constructs; the source becomes empty.
+  /// @param other Source.
+  Context(Context&& other) noexcept = default;
   /// @brief Move-assigns; shuts down the currently held context first.
   /// @param other Source.
   /// @return *this.

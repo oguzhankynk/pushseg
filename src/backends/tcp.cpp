@@ -163,7 +163,7 @@ void reader_loop(const std::shared_ptr<TcpLink>& link, const std::shared_ptr<Lin
 class TcpBackend final : public backend::StreamBackend {
 public:
   ~TcpBackend() override {
-    stop();
+    shutdown();
   }
 
   Status start(const Endpoint& self, const Options& opts, backend::StreamHost& host) override {
@@ -267,6 +267,11 @@ public:
   }
 
   void stop() override {
+    shutdown();
+  }
+
+private:
+  void shutdown() {
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (stopping_) {
@@ -301,7 +306,6 @@ public:
     }
   }
 
-private:
   bool port_for(unsigned long base, AppId app, InstId inst, unsigned long& port) const {
     if (inst >= stride_) {
       return false;

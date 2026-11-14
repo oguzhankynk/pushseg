@@ -144,8 +144,8 @@ public:
   std::shared_ptr<ConnImpl> connect(NodeId node, SegKey key, std::chrono::milliseconds timeout);
 
   // Used by SegImpl.
-  void seg_published(SegImpl& seg);
-  void seg_unpublished(SegImpl& seg);
+  void seg_published(const SegImpl& seg);
+  void seg_unpublished(const SegImpl& seg);
   void seg_released(SegKey key, std::uint8_t* base, bool mapped_alloc) noexcept;
 
   // Used by inbound stream links.

@@ -52,7 +52,7 @@ public:
       : ctx_(std::move(ctx)), be_(be), remote_(std::move(remote)), key_(key) {}
 
   ~StreamConn() override {
-    disconnect();
+    close();
   }
 
   Status open(Clock::time_point deadline) {
@@ -167,6 +167,10 @@ public:
   }
 
   void disconnect() override {
+    close();
+  }
+
+  void close() {
     std::shared_ptr<backend::Link> link;
     {
       std::lock_guard<std::mutex> lk(mu_);

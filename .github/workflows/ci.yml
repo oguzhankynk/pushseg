@@ -20,7 +20,7 @@ jobs:
           - preset: asan
             compiler: gcc
           - preset: tsan
-            compiler: gcc
+            compiler: clang  # the tsan preset uses clang (see CMakePresets.json)
     steps:
       - uses: actions/checkout@v4
 

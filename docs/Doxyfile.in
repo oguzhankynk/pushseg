@@ -5,11 +5,11 @@
 
 PROJECT_NAME           = "pushseg"
 PROJECT_NUMBER         = "@PUSHSEG_VERSION@"
-PROJECT_BRIEF          = "A modern C++ project template"
+PROJECT_BRIEF          = "Segment-based push-only data transfer over pluggable transports"
 OUTPUT_DIRECTORY       = "@PUSHSEG_DOXYGEN_OUTPUT_DIR@"
 
+# Public API only; src/ holds implementation details.
 INPUT                  = "@PUSHSEG_SOURCE_DIR@/include" \
-                          "@PUSHSEG_SOURCE_DIR@/src" \
                           "@PUSHSEG_SOURCE_DIR@/docs/mainpage.md"
 FILE_PATTERNS           = *.hpp *.h *.md
 RECURSIVE               = YES

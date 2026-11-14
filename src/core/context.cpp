@@ -298,7 +298,7 @@ std::shared_ptr<SegImpl> ContextImpl::create_segment(SegNo seg, std::size_t size
   return s;
 }
 
-void ContextImpl::seg_published(SegImpl& seg) {
+void ContextImpl::seg_published(const SegImpl& seg) {
   if (mapped_) {
     const Status st = mapped_->export_segment(seg.key().raw());
     if (st != Status::kOk) {
@@ -307,7 +307,7 @@ void ContextImpl::seg_published(SegImpl& seg) {
   }
 }
 
-void ContextImpl::seg_unpublished(SegImpl& seg) {
+void ContextImpl::seg_unpublished(const SegImpl& seg) {
   if (mapped_) {
     mapped_->unexport_segment(seg.key().raw());
   }

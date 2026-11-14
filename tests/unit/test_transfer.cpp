@@ -1,5 +1,6 @@
-// End-to-end tests of the memory contract, run once per backend level:
+// End-to-end tests of the memory contract, run once per backend:
 //   "tcp"      stream level (core wire protocol over TCP on localhost)
+//   "mq"       stream level over POSIX message queues
 //   "loopmem"  mapped level (in-process reference backend)
 // All "nodes" live in this one process as separate Contexts.
 
@@ -14,44 +15,18 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <sys/wait.h>
 #include <thread>
 #include <vector>
 
 #include <unistd.h>
 
+#include "test_util.hpp"
+
 namespace pushseg {
 namespace {
 
-using namespace std::chrono_literals;
-
-constexpr SegNo kSeg = 7;
-const SegKey kKey{1, 0, kSeg};  // app "test" = 1, inst 0
-
-// Distinct listening ports per test process, below the ephemeral range.
-std::string tcp_addr(NodeId node) {
-  const auto base = 10000U + static_cast<unsigned>(::getpid() % 5000) * 4U;
-  return "127.0.0.1:" + std::to_string(base + node);
-}
-
-Config make_config(const std::string& default_backend) {
-  Config cfg;
-  cfg.apps["test"] = 1;
-  for (NodeId n = 0; n < 3; ++n) {
-    cfg.nodes[n]["tcp"] = tcp_addr(n);
-    cfg.nodes[n]["loopmem"] = "";
-  }
-  cfg.default_backend = default_backend;
-  return cfg;
-}
-
-Status thrown_status(const std::function<void()>& fn) {
-  try {
-    fn();
-  } catch (const Error& e) {
-    return e.status();
-  }
-  return Status::kOk;
-}
+using namespace pushseg::test;  // NOLINT(google-build-using-namespace)
 
 class TransferTest : public ::testing::TestWithParam<std::string> {
 protected:
@@ -138,7 +113,9 @@ TEST_P(TransferTest, StoresNeverTearAndStayOrdered) {
   std::uint64_t backwards = 0;
   std::thread reader([&] {
     std::uint64_t last = 0;
-    while (!done.load()) {
+    // One more pass after `done`, so a fast writer can never finish unobserved.
+    for (bool fin = false; !fin;) {
+      fin = done.load();
       const auto v = load<std::uint64_t>(seg.at<std::uint64_t>(64));
       if ((v >> 32U) != (v & 0xFFFFFFFFU)) {
         ++torn;
@@ -178,7 +155,9 @@ TEST_P(TransferTest, FlagGuardsPrecedingBulkWrite) {
   std::uint64_t checked = 0;
   std::thread reader([&] {
     std::uint64_t last = 0;
-    while (!done.load()) {
+    // One more pass after `done`, so a fast writer can never finish unobserved.
+    for (bool fin = false; !fin;) {
+      fin = done.load();
       const auto f = load<std::uint64_t>(seg.at<std::uint64_t>(0));
       if (f == 0 || f == last) {
         continue;
@@ -326,7 +305,61 @@ TEST_P(TransferTest, EventHandlerReceivesNotifies) {
 
 INSTANTIATE_TEST_SUITE_P(Backends,
                          TransferTest,
-                         ::testing::Values("tcp", "loopmem"),
+                         ::testing::Values("tcp", "mq", "loopmem"),
+                         [](const ::testing::TestParamInfo<std::string>& i) { return i.param; });
+
+// The owner process dies without any goodbye (SIGKILL). The writer must
+// notice: TCP through the closed socket, mq through the owner's pid.
+class PeerCrashTest : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(PeerCrashTest, WriterDetectsKilledOwner) {
+  const Config cfg = make_config(GetParam());
+  int ready[2];
+  ASSERT_EQ(::pipe(ready), 0);
+  const pid_t child = ::fork();  // no Context exists yet, so we are single-threaded
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(ready[0]);
+    try {
+      Context owner(cfg, 0, "test");
+      LocalSegment seg = owner.create_segment(kSeg, 64);
+      seg.publish();
+      const char ok = 1;
+      (void)!::write(ready[1], &ok, 1);
+      ::pause();  // until killed
+    } catch (...) {
+    }
+    ::_exit(1);
+  }
+  ::close(ready[1]);
+  char ok = 0;
+  ASSERT_EQ(::read(ready[0], &ok, 1), 1);
+  ::close(ready[0]);
+
+  Context writer(cfg, 1, "test");
+  Connection c = writer.connect(0, kKey, 5s);
+  ASSERT_EQ(c.store<std::uint64_t>(0, 1), Status::kOk);
+  ASSERT_EQ(c.flush(), Status::kOk);
+
+  ::kill(child, SIGKILL);
+  ::waitpid(child, nullptr, 0);
+
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  Status st = Status::kOk;
+  while (st == Status::kOk && std::chrono::steady_clock::now() < deadline) {
+    st = c.notify(1);
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_EQ(st, Status::kDisconnected);
+
+  // A restarted owner takes over the dead one's identity (mq: stale lock file
+  // and listener queue are reclaimed), and cleans up on exit.
+  EXPECT_EQ(thrown_status([&] { Context again(cfg, 0, "test"); }), Status::kOk);
+}
+
+INSTANTIATE_TEST_SUITE_P(StreamBackends,
+                         PeerCrashTest,
+                         ::testing::Values("tcp", "mq"),
                          [](const ::testing::TestParamInfo<std::string>& i) { return i.param; });
 
 // One segment, written over two different backends at once:
@@ -349,10 +382,12 @@ TEST(MixedBackendTest, OneSegmentTwoTransports) {
   EXPECT_EQ(load<std::uint64_t>(seg.at<std::uint64_t>(8)), 2U);
 }
 
-TEST(ContextTest, SameProcessIdentityTwiceFailsOnTcp) {
-  const Config cfg = make_config("tcp");
-  Context a(cfg, 0, "test");
-  EXPECT_EQ(thrown_status([&] { Context b(cfg, 0, "test"); }), Status::kExists);
+TEST(ContextTest, SameIdentityTwiceFails) {
+  for (const char* be : {"tcp", "mq"}) {
+    const Config cfg = make_config(be);
+    Context a(cfg, 0, "test");
+    EXPECT_EQ(thrown_status([&] { Context b(cfg, 0, "test"); }), Status::kExists) << be;
+  }
 }
 
 TEST(ContextTest, UnknownBackendIsRejected) {

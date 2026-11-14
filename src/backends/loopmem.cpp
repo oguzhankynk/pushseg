@@ -52,14 +52,14 @@ struct Registry {
 };
 
 Registry& registry() {
-  static Registry* r = new Registry();
+  static Registry* const r = new Registry();
   return *r;
 }
 
 class LoopMemBackend final : public backend::MappedBackend {
 public:
   ~LoopMemBackend() override {
-    stop();
+    detach_host();
   }
 
   Status start(const Endpoint& self, const Options& /*opts*/, MappedHost& host) override {
@@ -171,6 +171,11 @@ public:
   }
 
   void stop() override {
+    detach_host();
+  }
+
+private:
+  void detach_host() {
     // Detach our host from our segments so that late interrupts are dropped.
     std::vector<std::shared_ptr<Segment>> mine;
     {
@@ -188,7 +193,6 @@ public:
     }
   }
 
-private:
   static std::shared_ptr<Segment> find(NodeId node, std::uint32_t key) {
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mu);

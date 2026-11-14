@@ -5,6 +5,7 @@ add_executable(pushseg_unit_tests
   unit/test_config.cpp
   unit/test_wire.cpp
   unit/test_transfer.cpp
+  unit/test_api.cpp
 )
 
 target_link_libraries(pushseg_unit_tests PRIVATE pushseg::pushseg GTest::gtest GTest::gtest_main)
