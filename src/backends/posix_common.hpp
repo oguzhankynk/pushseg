@@ -1,7 +1,8 @@
 #ifndef PUSHSEG_SRC_BACKENDS_POSIX_COMMON_HPP
 #define PUSHSEG_SRC_BACKENDS_POSIX_COMMON_HPP
 
-// Helpers shared by the same-host POSIX backends (mq, shm).
+// Helpers for the POSIX backends: shm (identity lock, naming, event queue
+// timeouts) and tcp (ThreadSanitizer annotations).
 
 #include "pushseg/backend.hpp"
 
@@ -78,18 +79,6 @@ inline timespec deadline_in(int ms) {
   ts.tv_sec += ms / 1000 + ts.tv_nsec / 1000000000L;
   ts.tv_nsec %= 1000000000L;
   return ts;
-}
-
-// The pid written into a lock file, or 0.
-inline pid_t read_pid(const std::string& path) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return 0;
-  }
-  char buf[32] = {};
-  const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
-  ::close(fd);
-  return n > 0 ? static_cast<pid_t>(std::strtol(buf, nullptr, 10)) : 0;
 }
 
 // An flock'ed file that makes an identity unique on the host while its owner

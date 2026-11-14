@@ -242,7 +242,7 @@ using StreamFactory = std::function<std::unique_ptr<StreamBackend>()>;
 using MappedFactory = std::function<std::unique_ptr<MappedBackend>()>;
 
 /// @brief Registers a stream backend under `name`. Replaces an existing one.
-/// Built-in: "tcp", "mq" (POSIX message queues, same host only).
+/// Built-in: "tcp".
 /// @param name Name used in the config file.
 /// @param factory Instance factory.
 void register_stream_backend(const std::string& name, StreamFactory factory);

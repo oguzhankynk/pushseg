@@ -8,7 +8,6 @@ namespace pushseg {
 namespace backends {
 // Built-in backends (src/backends/).
 std::unique_ptr<backend::StreamBackend> make_tcp_backend();
-std::unique_ptr<backend::StreamBackend> make_mq_backend();
 std::unique_ptr<backend::MappedBackend> make_loopmem_backend();
 std::unique_ptr<backend::MappedBackend> make_shm_backend();
 }  // namespace backends
@@ -53,7 +52,6 @@ Registry& registry() {
   static Registry* const r = [] {
     auto* reg = new Registry();
     reg->streams["tcp"] = backends::make_tcp_backend;
-    reg->streams["mq"] = backends::make_mq_backend;
     reg->mapped["loopmem"] = backends::make_loopmem_backend;
     reg->mapped["shm"] = backends::make_shm_backend;
     return reg;

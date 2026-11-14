@@ -64,12 +64,12 @@ TEST(ConfigFileTest, LoadsFromDisk) {
   const std::string path = ::testing::TempDir() + "pushseg_config_test.conf";
   {
     std::ofstream f(path);
-    f << "[apps]\nalgo = 3\n[node.5]\ntcp = 10.0.0.5\n[links]\ndefault = mq\n";
+    f << "[apps]\nalgo = 3\n[node.5]\ntcp = 10.0.0.5\n[links]\ndefault = shm\n";
   }
   const Config cfg = Config::load(path);
   EXPECT_EQ(cfg.app_id("algo"), 3);
   EXPECT_EQ(cfg.nodes.at(5).at("tcp"), "10.0.0.5");
-  EXPECT_EQ(cfg.backend_for(5, 5), "mq");
+  EXPECT_EQ(cfg.backend_for(5, 5), "shm");
   std::remove(path.c_str());
 }
 
@@ -192,9 +192,9 @@ TEST(ContextErrorTest, TcpRejectsBadAddressAndInstance) {
   EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kInvalidArgument);
 }
 
-TEST(ContextErrorTest, MqRejectsBadPrefix) {
-  Config cfg = make_config("mq");
-  cfg.backend_options["mq"]["name_prefix"] = "no-leading-slash";
+TEST(ContextErrorTest, ShmRejectsBadPrefix) {
+  Config cfg = make_config("shm");
+  cfg.backend_options["shm"]["name_prefix"] = "no-leading-slash";
   EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kInvalidArgument);
 }
 

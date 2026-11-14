@@ -13,7 +13,6 @@ add_library(pushseg
   core/stream_conn.cpp
   core/mapped_conn.cpp
   backends/tcp.cpp
-  backends/mq.cpp
   backends/shm.cpp
   backends/loopmem.cpp
 )

@@ -1,6 +1,5 @@
 // End-to-end tests of the memory contract, run once per backend:
 //   "tcp"      stream level (core wire protocol over TCP on localhost)
-//   "mq"       stream level over POSIX message queues
 //   "shm"      mapped level over POSIX shared memory
 //   "loopmem"  mapped level (in-process reference backend)
 // All "nodes" live in this one process as separate Contexts.
@@ -306,11 +305,11 @@ TEST_P(TransferTest, EventHandlerReceivesNotifies) {
 
 INSTANTIATE_TEST_SUITE_P(Backends,
                          TransferTest,
-                         ::testing::Values("tcp", "mq", "shm", "loopmem"),
+                         ::testing::Values("tcp", "shm", "loopmem"),
                          [](const ::testing::TestParamInfo<std::string>& i) { return i.param; });
 
 // The owner process dies without any goodbye (SIGKILL). The writer must
-// notice: TCP through the closed socket, mq and shm through the owner's pid.
+// notice: TCP through the closed socket, shm through the owner's pid.
 class PeerCrashTest : public ::testing::TestWithParam<std::string> {};
 
 TEST_P(PeerCrashTest, WriterDetectsKilledOwner) {
@@ -353,14 +352,14 @@ TEST_P(PeerCrashTest, WriterDetectsKilledOwner) {
   }
   EXPECT_EQ(st, Status::kDisconnected);
 
-  // A restarted owner takes over the dead one's identity (mq: stale lock file
-  // and listener queue are reclaimed), and cleans up on exit.
+  // A restarted owner takes over the dead one's identity (shm: stale lock file,
+  // event queue and segments are reclaimed), and cleans up on exit.
   EXPECT_EQ(thrown_status([&] { Context again(cfg, 0, "test"); }), Status::kOk);
 }
 
 INSTANTIATE_TEST_SUITE_P(SameHostBackends,
                          PeerCrashTest,
-                         ::testing::Values("tcp", "mq", "shm"),
+                         ::testing::Values("tcp", "shm"),
                          [](const ::testing::TestParamInfo<std::string>& i) { return i.param; });
 
 // One segment, written over two different backends at once:
@@ -384,7 +383,7 @@ TEST(MixedBackendTest, OneSegmentTwoTransports) {
 }
 
 TEST(ContextTest, SameIdentityTwiceFails) {
-  for (const char* be : {"tcp", "mq", "shm"}) {
+  for (const char* be : {"tcp", "shm"}) {
     const Config cfg = make_config(be);
     Context a(cfg, 0, "test");
     EXPECT_EQ(thrown_status([&] { Context b(cfg, 0, "test"); }), Status::kExists) << be;

@@ -5,9 +5,9 @@
 pushseg is a C++17 transport layer for sharing data between processes on
 different targets (machines). Applications see a single model: they **read
 their own segments through plain pointers** and **write into remote segments
-through one-way connections**. Whether the bytes travel over TCP, POSIX message
-queues, POSIX shared memory, or another API plugged in as a backend is chosen
-per node pair in a config file, and the application code does not change.
+through one-way connections**. Whether the bytes travel over TCP, POSIX shared
+memory, or another API plugged in as a backend is chosen per node pair in a
+config file, and the application code does not change.
 
 ```
    Node 1 (writer)                            Node 0 (owner)
@@ -106,30 +106,8 @@ base_port = 40000            # port = base + app*32 + inst
 | Name | Level | Scope | Notes |
 |---|---|---|---|
 | `tcp` | Stream | Any hosts | One TCP connection per `Connection`. Address: `host[:base_port]`. |
-| `mq` | Stream | Same host | POSIX message queues. Address unused. |
 | `shm` | Mapped | Same host | POSIX shared memory: writers store straight into the owner's memory. Address unused. |
 | `loopmem` | Mapped | Same process | Reference for writing a mapped backend; used by the tests. |
-
-### `mq` (POSIX message queues)
-
-```ini
-[links]
-0-1 = mq                     # nodes 0 and 1 run on the same machine
-
-[backend.mq]
-name_prefix = /pushseg       # queue names: <prefix>.<node>.<app>.<inst>, <prefix>.l<pid>.<n>.c2s/.s2c
-lock_dir    = /dev/shm       # identity lock files: <lock_dir>/<prefix>.<node>.<app>.<inst>.lock
-msgsize     = 8192           # bytes per message; <= /proc/sys/fs/mqueue/msgsize_max
-maxmsg      = 8              # messages per queue; <= /proc/sys/fs/mqueue/msg_max
-```
-
-- Each link uses two queues, about `2 * maxmsg * msgsize` bytes of kernel memory. The
-  per-user limit `ulimit -q` (often 800 KiB) therefore caps the number of open links:
-  about 6 with the defaults. Lower `msgsize`/`maxmsg` or raise the limit for more.
-- Message queues do not report a vanished peer. The backend reads the peer's pid from
-  its lock file and checks it periodically, so a killed peer is detected within ~200 ms.
-- A process restarted with the same `(node, app, inst)` takes over the stale lock file
-  and listener queue of a crashed predecessor.
 
 ### `shm` (POSIX shared memory)
 
@@ -162,7 +140,7 @@ in-process reference backend).
 
 | Level | You implement | The core does | Example |
 |---|---|---|---|
-| **Stream** (`StreamBackend`) | connect, listen, `sendv`, deliver received bytes via `on_recv` | The whole segment protocol: framing, writes, atomic stores, notify, fences | `src/backends/tcp.cpp`, `src/backends/mq.cpp` |
+| **Stream** (`StreamBackend`) | connect, listen, `sendv`, deliver received bytes via `on_recv` | The whole segment protocol: framing, writes, atomic stores, notify, fences | `src/backends/tcp.cpp` |
 | **Mapped** (`MappedBackend`) | alloc/export/import, `store_barrier`, `interrupt`, optional DMA | `write` = memcpy/DMA, `store` = wait DMA + barrier + store + barrier, `notify` = barrier + interrupt | `src/backends/shm.cpp`, `src/backends/loopmem.cpp` |
 
 At both levels the **core** enforces the atomicity and ordering contract. A
@@ -220,9 +198,8 @@ src/core/
   mapped_conn.cpp     Mapped level: turns the contract into barriers, DMA, interrupts
 src/backends/
   tcp.cpp         Built-in stream backend (TCP)
-  mq.cpp          Built-in stream backend (POSIX message queues, same host)
   shm.cpp         Built-in mapped backend (POSIX shared memory, same host)
-  posix_common.hpp  Identity lock and helpers shared by mq and shm
+  posix_common.hpp  Identity lock and helpers for shm; TSan annotations for shm and tcp
   loopmem.cpp     Built-in mapped backend (in-process; reference and tests)
 tests/unit/       Config, wire, API, and end-to-end contract tests
 examples/         pingpong + sample config
@@ -230,7 +207,7 @@ examples/         pingpong + sample config
 
 ## Known limits and next steps
 
-- The TCP and mq backends use one reader thread per link. Fine for tens of links; an epoll loop can replace it behind the same SPI.
+- The TCP backend uses one reader thread per link. Fine for tens of links; an epoll loop can replace it behind the same SPI.
 - No TCP heartbeat. Disconnects are detected through TCP keepalive and socket errors.
 - Mapped-level DMA writes currently wait synchronously. An async `write` API could defer the wait to the next ordering point.
 - No remote read-modify-write atomics (`fetch_add`, CAS). Use one slot per writer for multi-writer counters.
