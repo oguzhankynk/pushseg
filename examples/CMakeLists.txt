@@ -1,0 +1,5 @@
+add_executable(pushseg_pingpong pingpong.cpp)
+target_link_libraries(pushseg_pingpong PRIVATE pushseg::pushseg)
+pushseg_set_warnings(pushseg_pingpong)
+pushseg_enable_sanitizers(pushseg_pingpong)
+configure_file(pingpong.conf "${CMAKE_CURRENT_BINARY_DIR}/pingpong.conf" COPYONLY)
