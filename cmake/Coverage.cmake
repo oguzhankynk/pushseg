@@ -59,6 +59,9 @@ function(pushseg_add_coverage_target)
             --filter "include/pushseg/"
             --exclude "_deps/"
             --exclude "tests/"
+            # The ntb backend needs an NTB device (ntb_seg); it is tested
+            # between two VMs in ntb-lab (tests/t-pushseg.sh), not here.
+            --exclude "src/backends/ntb.cpp"
             # C++ exception handling adds a hidden branch to every call that
             # may throw; tests cannot target those, so they only dilute the
             # branch figure. Count real branches only.
