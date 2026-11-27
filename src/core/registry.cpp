@@ -10,6 +10,7 @@ namespace backends {
 std::unique_ptr<backend::StreamBackend> make_tcp_backend();
 std::unique_ptr<backend::MappedBackend> make_loopmem_backend();
 std::unique_ptr<backend::MappedBackend> make_shm_backend();
+std::unique_ptr<backend::MappedBackend> make_ntb_backend();
 }  // namespace backends
 
 namespace backend {
@@ -54,6 +55,7 @@ Registry& registry() {
     reg->streams["tcp"] = backends::make_tcp_backend;
     reg->mapped["loopmem"] = backends::make_loopmem_backend;
     reg->mapped["shm"] = backends::make_shm_backend;
+    reg->mapped["ntb"] = backends::make_ntb_backend;
     return reg;
   }();
   return *r;

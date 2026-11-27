@@ -107,6 +107,7 @@ base_port = 40000            # port = base + app*32 + inst
 |---|---|---|---|
 | `tcp` | Stream | Any hosts | One TCP connection per `Connection`. Address: `host[:base_port]`. |
 | `shm` | Mapped | Same host | POSIX shared memory: writers store straight into the owner's memory. Address unused. |
+| `ntb` | Mapped | Two hosts on a PCIe NTB link | Stores go through the NTB memory window into the peer's RAM; DMA for bulk writes. Needs the `ntb_seg` kernel module. Address unused. |
 | `loopmem` | Mapped | Same process | Reference for writing a mapped backend; used by the tests. |
 
 ### `shm` (POSIX shared memory)
@@ -129,6 +130,35 @@ event_maxmsg = 8             # pending notifications per process
   mapping is not reported to the owner.
 - A process restarted with the same `(node, app, inst)` removes the segments and the
   event queue a crashed predecessor left.
+
+### `ntb` (PCIe non-transparent bridge)
+
+```ini
+[links]
+0-1 = ntb                    # the two nodes on the NTB link
+
+[backend.ntb]
+device       = /dev/ntb_seg0 # this node's end of the link
+dma_threshold = 65536        # writes of at least this size use the NTB's DMA engine
+interrupt_timeout_ms = 5000  # how long a notify waits for room in the peer's mailbox
+start_timeout_ms = 30000     # how long start-up waits for the link to come up once
+```
+
+- Needs [`ntb_seg`](https://github.com/oguzhankynk/ntb-lab) on both hosts: a small
+  kernel module on top of the Linux NTB API, so any NTB hardware with a Linux driver
+  works. Load it with a segment size that holds all segments of the node
+  (`insmod ntb_seg.ko seg_size=4194304`; at most the memory window size).
+- Without hardware: two VMs with [qemu-ntb](https://github.com/oguzhankynk/qemu-ntb).
+  ntb-lab's `tests/t-pushseg.sh` runs `pushseg_pingpong` between them.
+- Writes are plain stores into the mapped window; notifications are queued in a
+  mailbox in the owner's memory, then a doorbell rings, so none is lost.
+- One process per node uses the link (one event stream per NTB device); a lock file
+  in `lock_dir` (default `/tmp`) enforces it.
+- On a window that is trapped MMIO rather than mapped memory (qemu-ntb without
+  `fast-mw`, or `ntbd`), set `dma_threshold = 0`: `memcpy` into trapped MMIO does not
+  work there, DMA does.
+- A peer that restarts or unloads the module turns the writer's next notification
+  into `kDisconnected`; a new `connect()` finds the new segments.
 
 The backend is chosen **per node pair**. One segment can be written over a mapped
 backend and over TCP at the same time (`MixedBackendTest` covers this with the
