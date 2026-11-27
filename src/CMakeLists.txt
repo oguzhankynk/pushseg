@@ -14,6 +14,7 @@ add_library(pushseg
   core/mapped_conn.cpp
   backends/tcp.cpp
   backends/shm.cpp
+  backends/ntb.cpp
   backends/loopmem.cpp
 )
 add_library(pushseg::pushseg ALIAS pushseg)

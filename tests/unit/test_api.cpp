@@ -198,6 +198,15 @@ TEST(ContextErrorTest, ShmRejectsBadPrefix) {
   EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kInvalidArgument);
 }
 
+// Without the ntb_seg module there is no device: start-up fails cleanly.
+TEST(ContextErrorTest, NtbWithoutDeviceFails) {
+  Config cfg = make_config("ntb");
+  cfg.backend_options["ntb"]["device"] = "/nonexistent/ntb_seg0";
+  EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kIoError);
+  // and a second attempt is not blocked by a stale lock
+  EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kIoError);
+}
+
 TEST(ContextErrorTest, AtMostOneMappedBackendPerNode) {
   backend::register_mapped_backend("loopmem2", [] { return backends::make_loopmem_backend(); });
   Config cfg = make_config("tcp");

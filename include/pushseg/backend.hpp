@@ -248,8 +248,9 @@ using MappedFactory = std::function<std::unique_ptr<MappedBackend>()>;
 void register_stream_backend(const std::string& name, StreamFactory factory);
 
 /// @brief Registers a mapped backend under `name`. Replaces an existing one.
-/// Built-in: "shm" (POSIX shared memory, same host only) and "loopmem"
-/// (in-process reference/test backend).
+/// Built-in: "shm" (POSIX shared memory, same host only), "ntb" (PCIe NTB
+/// through the ntb_seg kernel module) and "loopmem" (in-process
+/// reference/test backend).
 /// @param name Name used in the config file.
 /// @param factory Instance factory.
 void register_mapped_backend(const std::string& name, MappedFactory factory);
