@@ -15,13 +15,13 @@ config file, and the application code does not change.
 
 ```mermaid
 flowchart LR
-    subgraph W["node 1: writer"]
-        c["Connection c = ctx.connect(0, key)<br/>c.write(off, buf) · c.store(off, v)<br/>c.notify(imm)"]
+    subgraph writer["node 1: writer"]
+        c["Connection to a remote segment<br/>write · store · notify"]
     end
-    subgraph O["node 0: owner"]
-        s["LocalSegment seg<br/>seg.data() — plain reads<br/>seg.wait_event(ev)"]
+    subgraph owner["node 0: owner"]
+        s["LocalSegment<br/>plain reads · wait for events"]
     end
-    c ==>|"one way: TCP, shared memory, PCIe NTB, ..."| s
+    c ==>|one way: TCP, shared memory or PCIe NTB| s
 ```
 
 The same ping-pong program (`examples/pingpong.cpp`: an 8-byte store and a
