@@ -205,6 +205,13 @@ TEST(ContextErrorTest, NtbWithoutDeviceFails) {
   EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kIoError);
   // and a second attempt is not blocked by a stale lock
   EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kIoError);
+  // several processes share the device, each in a partition of its own
+  cfg.backend_options["ntb"]["processes"] = "4";
+  EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kIoError);
+  for (const char* bad : {"0", "17"}) {
+    cfg.backend_options["ntb"]["processes"] = bad;
+    EXPECT_EQ(thrown_status([&] { Context c(cfg, 0, "test"); }), Status::kInvalidArgument);
+  }
 }
 
 TEST(ContextErrorTest, AtMostOneMappedBackendPerNode) {

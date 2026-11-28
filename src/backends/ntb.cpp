@@ -3,17 +3,26 @@
 //
 // One NTB link joins two nodes. ntb_seg gives each side one local memory
 // region that the peer writes through its memory window, a mapping of the
-// peer's region, doorbells and a DMA engine. This backend divides the local
-// region:
+// peer's region, doorbells and a DMA engine.
 //
-//   [0, 4 KiB)        header: magic, version and generation, owner, and the
-//                     credit word the peer writes (how far it read our
-//                     notices in its mailbox)
+// Processes. Up to `processes` (N, the same on both nodes) processes per node
+// share the device. The local region and the DMA staging buffer are cut into
+// N equal partitions; a process claims the first free one with a lock file
+// and uses only that. Partition p of a node is laid out as:
+//
+//   [0, 4 KiB)        header: magic, version and generation, owner, N and the
+//                     partition size, and one credit word per peer partition
+//                     q, written by q (how far it read our notices)
 //   [4 KiB, 8 KiB)    directory: key, exported flag, offset, size and an
 //                     allocation number per local segment (the peer reads it)
-//   [8 KiB, 10 KiB)   mailbox: 64 slots the peer fills with interrupts and
-//                     connect/disconnect notices, then rings doorbell 0
-//   [16 KiB, end)     segment memory
+//   [8 KiB, ...)      N mailboxes: mailbox q holds 64 slots that peer
+//                     partition q fills with interrupts and connect/disconnect
+//                     notices, then rings doorbell p
+//   [heap, end)       segment memory (from 16 KiB, page aligned)
+//
+// A writer finds the owner of a segment by scanning the peer's partition
+// headers for its endpoint. ntb_seg gives every open file every event, so
+// each process sees the doorbells; it reads only its own mailboxes.
 //
 // The data path is a plain store into the mapped window (or a DMA copy).
 //
@@ -28,14 +37,15 @@
 // then calls into the core, so a handler that notifies the peer cannot
 // starve the peer of credit. No lock is held while waiting.
 //
-// Limits: one process per NTB device (ntb_seg has one event stream), and so
-// one process per node on an NTB link. Remote accesses by the backend are
+// Limits: N <= 16 and at most the number of doorbells; N > 1 needs an
+// ntb_seg that gives every file every event. Remote accesses by the backend are
 // 8-byte loads and stores; the core's own writes use memcpy, so on a trapped
 // MMIO window (qemu-ntb without fast-mw, ntbd) set dma_threshold = 0.
 
 #include "pushseg/backend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -102,6 +112,7 @@ constexpr std::uint64_t kMmapStaging = 0x60000000;
 constexpr std::uint32_t kLinkUp = 1U << 0U;
 constexpr std::uint32_t kPeerReady = 1U << 1U;
 constexpr std::uint32_t kHasDma = 1U << 2U;
+constexpr std::uint32_t kSharedEvents = 1U << 3U;
 constexpr std::uint32_t kEvLink = 2;
 constexpr char kIocType = 'N';
 const unsigned long kIocInfo = _IOR(kIocType, 0x40, SegInfo);        // NOLINT
@@ -113,29 +124,33 @@ const unsigned long kIocDmaWait = _IO(kIocType, 0x44);               // NOLINT
 // ---- layout of the local region ------------------------------------------
 
 constexpr std::uint64_t kMagic = 0x42544E4753555050ULL;  // "PUSGNTB" + version byte
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
+constexpr std::size_t kMaxProcs = 16;
 constexpr std::size_t kWord = 8;
 constexpr std::size_t kDirOff = 4096;
 constexpr std::size_t kDirEntries = 128;
 constexpr std::size_t kMboxOff = 8192;
 constexpr std::size_t kSlots = 64;
-constexpr std::size_t kHeapOff = 16384;
+constexpr std::size_t kMinHeapOff = 16384;
 constexpr std::size_t kAlign = 4096;
 constexpr std::size_t kDmaAlign = 64;
-constexpr std::uint64_t kDoorbell = 1;  // bit 0: "look at the mailbox"
-constexpr unsigned kHi = 32;            // upper half of a word
+constexpr unsigned kHi = 32;  // upper half of a word
 constexpr std::uint64_t kLo32 = 0xffffffffULL;
 
 // Header words.
-constexpr std::size_t kHdrMagic = 0 * kWord;   // kMagic
-constexpr std::size_t kHdrGen = 1 * kWord;     // version << 32 | generation
-constexpr std::size_t kHdrOwner = 2 * kWord;   // packed Endpoint (owner_word)
-constexpr std::size_t kHdrCredit = 3 * kWord;  // written by the peer: our gen << 32 | read count
+constexpr std::size_t kHdrMagic = 0 * kWord;  // kMagic
+constexpr std::size_t kHdrGen = 1 * kWord;    // version << 32 | generation
+constexpr std::size_t kHdrOwner = 2 * kWord;  // packed Endpoint (owner_word)
+constexpr std::size_t kHdrProcs = 3 * kWord;  // N
+constexpr std::size_t kHdrPart = 4 * kWord;   // partition size in bytes
+constexpr std::size_t kHdrCredit =
+    8 * kWord;  // [q], by peer partition q: our gen << 32 | read count
 
 // Directory entry (4 words): key | exported << 32, offset, size, allocation number.
 constexpr std::size_t kDirEntryBytes = 4 * kWord;
 // Mailbox slot (4 words): seq, key | sender gen << 32, imm, packed type and sender.
 constexpr std::size_t kSlotBytes = 4 * kWord;
+constexpr std::size_t kMboxBytes = kSlots * kSlotBytes;
 
 // Packing of the owner word and a slot's last word.
 constexpr unsigned kNodeShift = 0;
@@ -181,10 +196,11 @@ PeerId unpack_peer(std::uint64_t w) {
 
 // An imported segment.
 struct Import {
+  std::size_t part = 0;  // the owner's partition
   std::uint32_t key = 0;
   std::uint32_t owner_gen = 0;  // the owner's generation when we imported
   std::uint32_t link_gen = 0;   // ntb_seg's link generation then
-  std::size_t off = 0;          // offset in the peer's region
+  std::size_t off = 0;          // offset in the owner's partition
 };
 
 struct Importer {
@@ -221,10 +237,23 @@ public:
     const std::string dev = posix::opt(opts, "device", "/dev/ntb_seg0");
     const long start_ms = posix::opt_long(opts, "start_timeout_ms", 30000);  // NOLINT
     irq_timeout_ms_ = posix::opt_long(opts, "interrupt_timeout_ms", 5000);   // NOLINT
-    std::string lock = posix::opt(opts, "lock_dir", "/tmp");
-    lock += "/pushseg.ntb." + dev.substr(dev.rfind('/') + 1) + ".lock";
-    if (const Status st = lock_.acquire(lock); st != Status::kOk) {
-      return st;  // another process on this node uses the device
+    const long procs = posix::opt_long(opts, "processes", 1);
+    if (procs < 1 || procs > static_cast<long>(kMaxProcs)) {
+      return Status::kInvalidArgument;
+    }
+    procs_ = static_cast<std::size_t>(procs);
+    // a partition of our own: the first whose lock file is free
+    const std::string lock = posix::opt(opts, "lock_dir", "/tmp") + "/pushseg.ntb." +
+                             dev.substr(dev.rfind('/') + 1) + ".";
+    Status st = Status::kExists;
+    for (part_ = 0; part_ < procs_; ++part_) {
+      st = lock_.acquire(lock + std::to_string(part_) + ".lock");
+      if (st != Status::kExists) {
+        break;
+      }
+    }
+    if (st != Status::kOk) {
+      return st;  // kExists: all partitions are taken
     }
     fd_ = ::open(dev.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0) {
@@ -241,7 +270,11 @@ public:
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));  // NOLINT
     }
-    if (info.abi_version != kAbiVersion || info.local_size < kHeapOff + kAlign) {
+    heap_off_ =
+        std::max(kMinHeapOff, (kMboxOff + procs_ * kMboxBytes + kAlign - 1) / kAlign * kAlign);
+    const std::size_t lpart = info.local_size / procs_ / kAlign * kAlign;
+    if (info.abi_version != kAbiVersion || lpart < heap_off_ + kAlign ||
+        (procs_ > 1 && ((info.flags & kSharedEvents) == 0 || info.db_count < procs_))) {
       shutdown();
       return Status::kUnsupported;
     }
@@ -255,8 +288,10 @@ public:
       shutdown();
       return Status::kIoError;
     }
-    local_ = static_cast<std::uint8_t*>(p);
-    local_size_ = info.local_size;
+    local_map_ = static_cast<std::uint8_t*>(p);
+    local_map_size_ = info.local_size;
+    local_ = local_map_ + part_ * lpart;  // NOLINT
+    local_size_ = lpart;
     if (info.staging_size != 0) {
       p = ::mmap(nullptr,
                  info.staging_size,
@@ -265,22 +300,26 @@ public:
                  fd_,
                  static_cast<off_t>(kMmapStaging));
       if (p != MAP_FAILED) {
-        staging_ = static_cast<std::uint8_t*>(p);
-        staging_size_ = info.staging_size;
+        staging_map_ = static_cast<std::uint8_t*>(p);
+        staging_map_size_ = info.staging_size;
+        staging_size_ = info.staging_size / procs_ / kDmaAlign * kDmaAlign;
+        staging_base_ = part_ * staging_size_;
       }
     }
-    has_dma_ = (info.flags & kHasDma) != 0 && staging_ != nullptr;
+    has_dma_ = (info.flags & kHasDma) != 0 && staging_map_ != nullptr && staging_size_ != 0;
 
-    // A fresh region: everything a previous process left is void.
-    std::memset(local_ + kDirOff, 0, kHeapOff - kDirOff);  // NOLINT
+    // A fresh partition: everything a previous process left is void.
+    store64(local_, kHdrMagic, 0);
+    std::memset(local_ + kHdrProcs, 0, heap_off_ - kHdrProcs);  // NOLINT
     gen_ = (static_cast<std::uint32_t>(std::time(nullptr)) ^
             (static_cast<std::uint32_t>(::getpid()) << kAppShift)) |
            1U;
-    store64(local_, kHdrCredit, 0);
+    store64(local_, kHdrProcs, procs_);
+    store64(local_, kHdrPart, local_size_);
     store64(local_, kHdrOwner, pack_peer(self.node, self.app, self.inst));
     store64(local_, kHdrGen, (static_cast<std::uint64_t>(kVersion) << kHi) | gen_);
     store64(local_, kHdrMagic, kMagic);  // last: the header is complete
-    free_.emplace(kHeapOff, local_size_ - kHeapOff);
+    free_.emplace(heap_off_, local_size_ - heap_off_);
     ready_ = (info.flags & (kLinkUp | kPeerReady)) == (kLinkUp | kPeerReady);
 
     wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -383,28 +422,37 @@ public:
     std::uint64_t size = 0;
     {
       std::shared_lock<std::shared_mutex> lk(map_mu_);
-      if (load64(remote_, kHdrMagic) != kMagic ||
-          unpack_peer(load64(remote_, kHdrOwner)).node != remote.node) {
-        return Status::kNotFound;
+      const std::uint64_t owner = pack_peer(remote.node, remote.app, remote.inst);
+      std::size_t q = 0;
+      for (; q < procs_; ++q) {
+        if (load64(rpart(q), kHdrMagic) == kMagic && load64(rpart(q), kHdrOwner) == owner) {
+          break;
+        }
       }
-      const std::uint64_t genw = load64(remote_, kHdrGen);
-      if ((genw >> kHi) != kVersion) {
-        return Status::kProtocolError;
+      if (q == procs_) {
+        return Status::kNotFound;  // the owner has not started (yet)
       }
+      volatile std::uint8_t* hdr = rpart(q);
+      const std::uint64_t genw = load64(hdr, kHdrGen);
+      if ((genw >> kHi) != kVersion || load64(hdr, kHdrProcs) != procs_ ||
+          load64(hdr, kHdrPart) != rpart_size_) {
+        return Status::kProtocolError;  // another layout: "processes" or seg_size differ
+      }
+      const std::size_t heap = heap_off_;  // the same N, so the same layout
       std::size_t i = 0;
       for (; i < kDirEntries; ++i) {
-        const std::uint64_t w0 = load64(remote_, dir_off(i));
+        const std::uint64_t w0 = load64(hdr, dir_off(i));
         if ((w0 & kLo32) != key || (w0 >> kHi) == 0) {
           continue;
         }
-        const std::uint64_t no = load64(remote_, dir_off(i) + 3 * kWord);
-        const std::uint64_t off = load64(remote_, dir_off(i) + kWord);
-        size = load64(remote_, dir_off(i) + 2 * kWord);
+        const std::uint64_t no = load64(hdr, dir_off(i) + 3 * kWord);
+        const std::uint64_t off = load64(hdr, dir_off(i) + kWord);
+        size = load64(hdr, dir_off(i) + 2 * kWord);
         // the owner may have freed and reused the entry meanwhile
-        if (load64(remote_, dir_off(i)) != w0 || load64(remote_, dir_off(i) + 3 * kWord) != no) {
+        if (load64(hdr, dir_off(i)) != w0 || load64(hdr, dir_off(i) + 3 * kWord) != no) {
           return Status::kNotFound;
         }
-        if (off < kHeapOff || size == 0 || off > remote_size_ || size > remote_size_ - off) {
+        if (off < heap || size == 0 || off > rpart_size_ || size > rpart_size_ - off) {
           return Status::kProtocolError;
         }
         imp->off = off;
@@ -413,10 +461,11 @@ public:
       if (i == kDirEntries) {
         return Status::kNotFound;
       }
+      imp->part = q;
       imp->key = key;
       imp->owner_gen = static_cast<std::uint32_t>(genw & kLo32);
       imp->link_gen = info.link_gen;
-      out.base = remote_ + imp->off;  // NOLINT
+      out.base = hdr + imp->off;  // NOLINT
     }
     // the owner must know we write there, before we do (see free_segment)
     if (send(*imp, SlotType::kConnect, 0) != Status::kOk) {
@@ -458,7 +507,7 @@ public:
     const auto* imp = static_cast<const Import*>(seg.handle);
     const auto* s = static_cast<const std::uint8_t*>(src);
     std::lock_guard<std::mutex> lk(dma_mu_);
-    if (staging_ == nullptr) {
+    if (staging_map_ == nullptr) {
       return Status::kDisconnected;
     }
     while (len != 0) {
@@ -469,8 +518,8 @@ public:
         }
         staging_pos_ = 0;
       }
-      std::memcpy(staging_ + staging_pos_, s, n);  // NOLINT
-      SegDma d{staging_pos_, imp->off + off, n};
+      std::memcpy(staging_map_ + staging_base_ + staging_pos_, s, n);  // NOLINT
+      SegDma d{staging_base_ + staging_pos_, imp->part * rpart_size_ + imp->off + off, n};
       if (::ioctl(fd_, kIocDmaWrite, &d) != 0) {  // NOLINT
         return errno == EINVAL ? Status::kOutOfRange : Status::kDisconnected;
       }
@@ -503,8 +552,14 @@ private:
     return kDirOff + i * kDirEntryBytes;
   }
 
-  static std::size_t slot_off(std::uint64_t seq) {
-    return kMboxOff + (seq % kSlots) * kSlotBytes;
+  // Slot @seq of mailbox @from (the sender's partition).
+  static std::size_t slot_off(std::size_t from, std::uint64_t seq) {
+    return kMboxOff + from * kMboxBytes + (seq % kSlots) * kSlotBytes;
+  }
+
+  // Under map_mu_: the peer's partition @q.
+  volatile std::uint8_t* rpart(std::size_t q) const {
+    return remote_ + q * rpart_size_;  // NOLINT
   }
 
   bool get_info(SegInfo& info) const {
@@ -514,7 +569,7 @@ private:
   // Maps the peer's region. A mapping in use by an import is never replaced
   // (the core holds pointers into it); a different size waits until then.
   bool ensure_remote(const SegInfo& info) {
-    if (info.remote_size < kHeapOff) {
+    if (info.remote_size / procs_ < heap_off_ + kAlign) {
       return false;
     }
     {
@@ -538,6 +593,7 @@ private:
                      static_cast<off_t>(kMmapRemote));
     remote_ = p == MAP_FAILED ? nullptr : static_cast<volatile std::uint8_t*>(p);
     remote_size_ = remote_ == nullptr ? 0 : info.remote_size;
+    rpart_size_ = remote_size_ / procs_ / kAlign * kAlign;
     return remote_ != nullptr;
   }
 
@@ -545,48 +601,52 @@ private:
   bool session_alive(const Import& imp) const {
     SegInfo info{};
     return remote_ != nullptr && get_info(info) && (info.flags & kPeerReady) != 0 &&
-           info.link_gen == imp.link_gen && load64(remote_, kHdrMagic) == kMagic &&
-           (load64(remote_, kHdrGen) & kLo32) == imp.owner_gen;
+           info.link_gen == imp.link_gen && load64(rpart(imp.part), kHdrMagic) == kMagic &&
+           (load64(rpart(imp.part), kHdrGen) & kLo32) == imp.owner_gen;
   }
 
   // How many of our notices the owner has not read yet. The credit word may
   // be from an older session; then it counts as "nothing read".
-  std::uint64_t unread() const {
-    const std::uint64_t c = load64(local_, kHdrCredit);
+  std::uint64_t unread(std::size_t q) const {
+    const std::uint64_t c = load64(local_, kHdrCredit + q * kWord);
     const std::uint64_t read = (c >> kHi) == gen_ ? (c & kLo32) : 0;
-    return static_cast<std::uint32_t>(static_cast<std::uint32_t>(tx_seq_) - read);
+    return static_cast<std::uint32_t>(static_cast<std::uint32_t>(tx_.at(q).seq) - read);
   }
 
-  // One mailbox slot, then doorbell 0. Waits (unlocked for everyone but other
-  // senders) while the owner's mailbox is full: notices are never dropped.
+  // One slot in our mailbox at the owner, then the owner's doorbell. Waits
+  // (unlocked for everyone but other senders to that partition) while the
+  // mailbox is full: notices are never dropped.
   Status send(const Import& imp, SlotType type, std::uint64_t imm) {
-    std::lock_guard<std::mutex> tx(tx_mu_);
+    const std::size_t q = imp.part;
+    Tx& t = tx_.at(q);
+    std::lock_guard<std::mutex> tx(t.mu);
     const std::uint64_t session = (static_cast<std::uint64_t>(imp.owner_gen) << kHi) | imp.link_gen;
     if (local_ == nullptr) {
       return Status::kDisconnected;
-    }
-    if (session != tx_session_) {  // a new owner or a new link: its mailbox is empty
-      tx_session_ = session;
-      tx_seq_ = 0;
-      store64(local_, kHdrCredit, static_cast<std::uint64_t>(gen_) << kHi);
     }
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(irq_timeout_ms_);
     while (true) {
       {
         std::shared_lock<std::shared_mutex> lk(map_mu_);
         if (!session_alive(imp)) {
-          return Status::kDisconnected;
+          return Status::kDisconnected;  // and leaves the live session's state alone
         }
-        if (unread() < kSlots) {
-          const std::size_t o = slot_off(tx_seq_);
-          store64(remote_, o + kWord, imp.key | (static_cast<std::uint64_t>(gen_) << kHi));
-          store64(remote_, o + 2 * kWord, imm);
-          store64(remote_,
+        if (session != t.session) {  // a new owner or a new link: its mailbox is empty
+          t.session = session;
+          t.seq = 0;
+          store64(local_, kHdrCredit + q * kWord, static_cast<std::uint64_t>(gen_) << kHi);
+        }
+        if (unread(q) < kSlots) {
+          volatile std::uint8_t* owner = rpart(q);
+          const std::size_t o = slot_off(part_, t.seq);
+          store64(owner, o + kWord, imp.key | (static_cast<std::uint64_t>(gen_) << kHi));
+          store64(owner, o + 2 * kWord, imm);
+          store64(owner,
                   o + 3 * kWord,
                   static_cast<std::uint64_t>(type) |
                       (pack_peer(self_.node, self_.app, self_.inst) << kSlotSenderShift));
           sfence();
-          store64(remote_, o, ++tx_seq_);  // the slot is valid from here
+          store64(owner, o, ++t.seq);  // the slot is valid from here
           break;
         }
       }
@@ -595,7 +655,7 @@ private:
       }
       std::this_thread::sleep_for(std::chrono::microseconds(100));  // NOLINT
     }
-    const std::uint64_t bell = kDoorbell;
+    const std::uint64_t bell = 1ULL << q;
     return ::ioctl(fd_, kIocRing, &bell) == 0 ? Status::kOk : Status::kDisconnected;  // NOLINT
   }
 
@@ -632,78 +692,117 @@ private:
     free_.emplace(off, len);
   }
 
-  // Reader thread: take the notices waiting in our mailbox, in order. A
+  // Reader thread: take the notices waiting in mailbox @j, in order. A
   // sender that restarted begins again at slot 0 with a new generation.
-  void take_notices(std::vector<Notice>& out, bool& sender_restarted) {
+  void take_notices(std::size_t j, std::vector<Notice>& out, bool& sender_restarted) {
+    Rx& x = rx_.at(j);
     while (true) {
-      const std::size_t o = slot_off(rx_seq_);
+      const std::size_t o = slot_off(j, x.seq);
       const std::uint64_t seq = load64(local_, o);
       const std::uint64_t w1 = load64(local_, o + kWord);
       const auto g = static_cast<std::uint32_t>(w1 >> kHi);
-      if (seq == rx_seq_ + 1 && g != 0 && (rx_gen_ == 0 || g == rx_gen_)) {
+      if (seq == x.seq + 1 && g != 0 && (x.gen == 0 || g == x.gen)) {
         const std::uint64_t imm = load64(local_, o + 2 * kWord);
         const std::uint64_t w3 = load64(local_, o + 3 * kWord);
         out.push_back(Notice{static_cast<SlotType>(w3 & kByte),
                              static_cast<std::uint32_t>(w1 & kLo32),
                              unpack_peer(w3 >> kSlotSenderShift),
                              imm});
-        rx_gen_ = g;
-        ++rx_seq_;
+        x.gen = g;
+        ++x.seq;
         continue;
       }
-      const std::uint64_t s0 = load64(local_, kMboxOff);
-      const auto g0 = static_cast<std::uint32_t>(load64(local_, kMboxOff + kWord) >> kHi);
-      if (s0 == 1 && g0 != 0 && g0 != rx_gen_) {
-        sender_restarted = sender_restarted || rx_gen_ != 0;
-        rx_seq_ = 0;
-        rx_gen_ = g0;
+      const std::size_t o0 = slot_off(j, 0);
+      const std::uint64_t s0 = load64(local_, o0);
+      const auto g0 = static_cast<std::uint32_t>(load64(local_, o0 + kWord) >> kHi);
+      if (s0 == 1 && g0 != 0 && g0 != x.gen) {
+        sender_restarted = sender_restarted || x.gen != 0;
+        x.seq = 0;
+        x.gen = g0;
         continue;
       }
       return;
     }
   }
 
-  // Reader thread: credit first, then the core's callbacks.
-  void drain_mailbox() {
-    std::vector<Notice> notices;
-    bool restarted = false;
-    take_notices(notices, restarted);
-    if (rx_gen_ != 0) {
-      SegInfo info{};
-      if (get_info(info) && (info.flags & kPeerReady) != 0) {
-        (void)ensure_remote(info);
+  // Reader thread: per mailbox, credit first, then the core's callbacks.
+  void drain_mailboxes() {
+    bool mapped = false;
+    // a handler may stop the backend (shutdown() from this thread): then stop
+    for (std::size_t j = 0; j < procs_ && !stopped(); ++j) {
+      std::vector<Notice> notices;
+      bool restarted = false;
+      take_notices(j, notices, restarted);
+      Rx& x = rx_.at(j);
+      if (x.gen != 0) {
+        if (!mapped) {
+          SegInfo info{};
+          if (get_info(info) && (info.flags & kPeerReady) != 0) {
+            (void)ensure_remote(info);
+          }
+          mapped = true;
+        }
+        std::shared_lock<std::shared_mutex> lk(map_mu_);
+        if (remote_ != nullptr) {
+          store64(rpart(j),
+                  kHdrCredit + part_ * kWord,
+                  (static_cast<std::uint64_t>(x.gen) << kHi) | (x.seq & kLo32));
+          sfence();
+        }
       }
-      std::shared_lock<std::shared_mutex> lk(map_mu_);
-      if (remote_ != nullptr) {
-        store64(
-            remote_, kHdrCredit, (static_cast<std::uint64_t>(rx_gen_) << kHi) | (rx_seq_ & kLo32));
-        sfence();
+      if (restarted && x.has_peer) {
+        lose_importers(&x.peer);  // the old process's imports died with it
+      }
+      for (const Notice& n : notices) {
+        if (stopped()) {
+          return;
+        }
+        moved_from_other_mailbox(j, n.from);
+        x.peer = n.from;
+        x.has_peer = true;
+        deliver(n);
       }
     }
-    if (restarted) {
-      lose_all_importers();  // the old process's imports died with it
-    }
-    for (const Notice& n : notices) {
-      switch (n.type) {
-        case SlotType::kInterrupt:
-          host_->on_interrupt(n.key, n.from, n.imm);
-          break;
-        case SlotType::kConnect: {
-          std::lock_guard<std::mutex> lk(mu_);
-          importers_.insert(Importer{n.key, n.from});
-        }
-          host_->on_peer_connect(n.key, n.from);
-          break;
-        case SlotType::kDisconnect: {
-          std::lock_guard<std::mutex> lk(mu_);
-          importers_.erase(Importer{n.key, n.from});
-          release_quarantine_locked(n.key);
-        }
-          host_->on_peer_disconnect(n.key, n.from, false);
-          break;
-        default:
-          break;  // unknown: a newer peer
+  }
+
+  bool stopped() const {
+    return stopping_.load(std::memory_order_acquire);
+  }
+
+  // Reader thread: an endpoint lives in one partition at a time. If @who now
+  // writes from mailbox @j but used another one before, its old process
+  // died and it came back elsewhere: its old imports are gone.
+  void moved_from_other_mailbox(std::size_t j, const PeerId& who) {
+    for (std::size_t i = 0; i < procs_; ++i) {
+      Rx& o = rx_.at(i);
+      if (i != j && o.has_peer && o.peer.node == who.node && o.peer.app == who.app &&
+          o.peer.inst == who.inst) {
+        o.has_peer = false;
+        lose_importers(&who);
       }
+    }
+  }
+
+  void deliver(const Notice& n) {
+    switch (n.type) {
+      case SlotType::kInterrupt:
+        host_->on_interrupt(n.key, n.from, n.imm);
+        break;
+      case SlotType::kConnect: {
+        std::lock_guard<std::mutex> lk(mu_);
+        importers_.insert(Importer{n.key, n.from});
+      }
+        host_->on_peer_connect(n.key, n.from);
+        break;
+      case SlotType::kDisconnect: {
+        std::lock_guard<std::mutex> lk(mu_);
+        importers_.erase(Importer{n.key, n.from});
+        release_quarantine_locked(n.key);
+      }
+        host_->on_peer_disconnect(n.key, n.from, false);
+        break;
+      default:
+        break;  // unknown: a newer peer
     }
   }
 
@@ -719,16 +818,32 @@ private:
     quarantine_.erase(range.first, range.second);
   }
 
-  // Reader thread: the peer process or the link went away.
-  void lose_all_importers() {
+  // Reader thread: a peer process (@who) or, with nullptr, the link went away.
+  void lose_importers(const PeerId* who) {
     std::set<Importer> lost;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      lost.swap(importers_);
-      for (const auto& q : quarantine_) {
-        release_range(q.second.off, q.second.len);
+      if (who == nullptr) {
+        lost.swap(importers_);
+      } else {
+        for (auto it = importers_.begin(); it != importers_.end();) {
+          if (it->peer.node == who->node && it->peer.app == who->app &&
+              it->peer.inst == who->inst) {
+            lost.insert(*it);
+            it = importers_.erase(it);
+          } else {
+            ++it;
+          }
+        }
       }
-      quarantine_.clear();
+      for (auto q = quarantine_.begin(); q != quarantine_.end();) {
+        if (!has_importer_locked(q->first)) {
+          release_range(q->second.off, q->second.len);
+          q = quarantine_.erase(q);
+        } else {
+          ++q;
+        }
+      }
     }
     for (const Importer& i : lost) {
       host_->on_peer_disconnect(i.key, i.peer, true);
@@ -736,10 +851,14 @@ private:
   }
 
   void link_lost() {
-    lose_all_importers();
-    rx_seq_ = 0;
-    rx_gen_ = 0;
-    std::memset(local_ + kMboxOff, 0, kSlots * kSlotBytes);  // NOLINT
+    lose_importers(nullptr);
+    if (stopped()) {
+      return;  // a handler stopped the backend: the region is gone
+    }
+    for (Rx& x : rx_) {
+      x = Rx{};
+    }
+    std::memset(local_ + kMboxOff, 0, procs_ * kMboxBytes);  // NOLINT
   }
 
   void event_loop() {
@@ -771,7 +890,7 @@ private:
         link_lost();  // device removed
         return;
       }
-      drain_mailbox();
+      drain_mailboxes();
     }
   }
 
@@ -790,20 +909,27 @@ private:
         reader_.join();
       }
     }
-    std::scoped_lock lk(tx_mu_, mu_, dma_mu_);
+    std::vector<std::unique_lock<std::mutex>> txl;
+    for (Tx& t : tx_) {
+      txl.emplace_back(t.mu);
+    }
+    std::scoped_lock lk(mu_, dma_mu_);
     std::unique_lock<std::shared_mutex> mlk(map_mu_);
     if (local_ != nullptr) {
       store64(local_, kHdrMagic, 0);  // the peer's next import or notify fails
-      ::munmap(local_, local_size_);
       local_ = nullptr;
+    }
+    if (local_map_ != nullptr) {
+      ::munmap(local_map_, local_map_size_);
+      local_map_ = nullptr;
     }
     if (remote_ != nullptr) {
       ::munmap(const_cast<std::uint8_t*>(remote_), remote_size_);  // NOLINT
       remote_ = nullptr;
     }
-    if (staging_ != nullptr) {
-      ::munmap(staging_, staging_size_);
-      staging_ = nullptr;
+    if (staging_map_ != nullptr) {
+      ::munmap(staging_map_, staging_map_size_);
+      staging_map_ = nullptr;
     }
     if (fd_ >= 0) {
       ::close(fd_);
@@ -826,9 +952,15 @@ private:
   std::atomic<bool> stopping_{false};
   std::thread reader_;
 
-  // Lock order: tx_mu_, then map_mu_; mu_ and dma_mu_ are taken alone.
-  std::mutex mu_;  // local segments, directory, importers
-  std::uint8_t* local_ = nullptr;
+  std::size_t procs_ = 1;  // partitions per node (N)
+  std::size_t part_ = 0;   // ours
+  std::size_t heap_off_ = kMinHeapOff;
+
+  // Lock order: a Tx::mu, then map_mu_; mu_ and dma_mu_ are taken alone.
+  std::mutex mu_;                      // local segments, directory, importers
+  std::uint8_t* local_map_ = nullptr;  // the whole local region
+  std::size_t local_map_size_ = 0;
+  std::uint8_t* local_ = nullptr;  // our partition of it
   std::size_t local_size_ = 0;
   std::map<std::uint32_t, Local> segs_;
   std::multimap<std::uint32_t, Local> quarantine_;  // freed, but still imported
@@ -839,22 +971,34 @@ private:
   std::shared_mutex map_mu_;  // the peer's region mapping
   volatile std::uint8_t* remote_ = nullptr;
   std::size_t remote_size_ = 0;
+  std::size_t rpart_size_ = 0;
   std::atomic<long> n_imports_{0};
 
-  std::mutex tx_mu_;  // our notices into the peer's mailbox
-  std::uint64_t tx_seq_ = 0;
-  std::uint64_t tx_session_ = 0;
+  // Our notices into the mailbox of each peer partition.
+  struct Tx {
+    std::mutex mu;
+    std::uint64_t seq = 0;
+    std::uint64_t session = 0;
+  };
+  std::array<Tx, kMaxProcs> tx_;
 
   std::mutex dma_mu_;
-  std::uint8_t* staging_ = nullptr;
+  std::uint8_t* staging_map_ = nullptr;  // the whole staging buffer
+  std::size_t staging_map_size_ = 0;
+  std::size_t staging_base_ = 0;  // our part of it
   std::size_t staging_size_ = 0;
   std::size_t staging_pos_ = 0;
   bool has_dma_ = false;
 
   // reader thread only
   bool ready_ = false;
-  std::uint64_t rx_seq_ = 0;
-  std::uint32_t rx_gen_ = 0;  // generation of the sender we are reading
+  struct Rx {
+    std::uint64_t seq = 0;
+    std::uint32_t gen = 0;  // generation of the sender we are reading
+    PeerId peer{};          // who sent the last notice
+    bool has_peer = false;
+  };
+  std::array<Rx, kMaxProcs> rx_{};
 };
 
 }  // namespace

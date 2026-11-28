@@ -12,6 +12,7 @@
 #include <ctime>
 #include <string>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #include <fcntl.h>
@@ -107,6 +108,16 @@ public:
       ::close(fd_);
       fd_ = -1;
       return err == EWOULDBLOCK ? Status::kExists : Status::kIoError;
+    }
+    // the holder unlinks the file before it lets go: a lock on that old
+    // file is no lock, take the one now at the path
+    struct stat held {};
+    struct stat now {};
+    if (::fstat(fd_, &held) != 0 || ::stat(path.c_str(), &now) != 0 || held.st_ino != now.st_ino ||
+        held.st_dev != now.st_dev) {
+      ::close(fd_);
+      fd_ = -1;
+      return acquire(path);
     }
     const std::string pid = std::to_string(::getpid()) + "\n";
     if (::ftruncate(fd_, 0) != 0 ||
