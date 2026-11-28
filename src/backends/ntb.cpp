@@ -855,9 +855,7 @@ private:
     if (stopped()) {
       return;  // a handler stopped the backend: the region is gone
     }
-    for (Rx& x : rx_) {
-      x = Rx{};
-    }
+    rx_.fill(Rx{});
     std::memset(local_ + kMboxOff, 0, procs_ * kMboxBytes);  // NOLINT
   }
 
@@ -911,7 +909,7 @@ private:
     }
     std::vector<std::unique_lock<std::mutex>> txl;
     for (Tx& t : tx_) {
-      txl.emplace_back(t.mu);
+      txl.emplace_back(t.mu);  // cppcheck-suppress useStlAlgorithm
     }
     std::scoped_lock lk(mu_, dma_mu_);
     std::unique_lock<std::shared_mutex> mlk(map_mu_);
