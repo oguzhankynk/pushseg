@@ -142,6 +142,7 @@ device       = /dev/ntb_seg0 # this node's end of the link
 dma_threshold = 65536        # writes of at least this size use the NTB's DMA engine
 interrupt_timeout_ms = 5000  # how long a notify waits for room in the peer's mailbox
 start_timeout_ms = 30000     # how long start-up waits for the link to come up once
+processes    = 1             # pushseg processes per node on this link (1 to 16)
 ```
 
 - Needs [`ntb_seg`](https://github.com/oguzhankynk/ntb-lab) on both hosts: a small
@@ -152,8 +153,12 @@ start_timeout_ms = 30000     # how long start-up waits for the link to come up o
   ntb-lab's `tests/t-pushseg.sh` runs `pushseg_pingpong` between them.
 - Writes are plain stores into the mapped window; notifications are queued in a
   mailbox in the owner's memory, then a doorbell rings, so none is lost.
-- One process per node uses the link (one event stream per NTB device); a lock file
-  in `lock_dir` (default `/tmp`) enforces it.
+- Up to `processes` processes per node share the link. Each takes a partition of
+  the node's segment (and of the DMA staging buffer) through a lock file in
+  `lock_dir` (default `/tmp`); a process beyond that fails with `kExists`. Set the
+  same value on both nodes, and load `ntb_seg` with the same `seg_size` on both.
+  More than one needs as many doorbells and an `ntb_seg` that gives every open
+  file every event (ntb-lab after 2026-11-28).
 - On a window that is trapped MMIO rather than mapped memory (qemu-ntb without
   `fast-mw`, or `ntbd`), set `dma_threshold = 0`: `memcpy` into trapped MMIO does not
   work there, DMA does.
