@@ -2,21 +2,53 @@
 
 **Write far, read local.**
 
+[![CI](https://github.com/oguzhankynk/pushseg/actions/workflows/ci.yml/badge.svg)](https://github.com/oguzhankynk/pushseg/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/oguzhankynk/pushseg)](https://github.com/oguzhankynk/pushseg/releases/latest)
+[![license](https://img.shields.io/github/license/oguzhankynk/pushseg)](LICENSE)
+
 pushseg is a C++17 transport layer for sharing data between processes on
 different targets (machines). Applications see a single model: they **read
 their own segments through plain pointers** and **write into remote segments
 through one-way connections**. Whether the bytes travel over TCP, POSIX shared
-memory, or another API plugged in as a backend is chosen per node pair in a
+memory, a PCIe NTB link, or another API plugged in as a backend is chosen per node pair in a
 config file, and the application code does not change.
 
+```mermaid
+flowchart LR
+    subgraph W["node 1: writer"]
+        c["Connection c = ctx.connect(0, key)<br/>c.write(off, buf) · c.store(off, v)<br/>c.notify(imm)"]
+    end
+    subgraph O["node 0: owner"]
+        s["LocalSegment seg<br/>seg.data() — plain reads<br/>seg.wait_event(ev)"]
+    end
+    c ==>|"one way: TCP, shared memory, PCIe NTB, ..."| s
 ```
-   Node 1 (writer)                            Node 0 (owner)
- ┌──────────────────────┐                   ┌──────────────────────┐
- │ Connection c =       │══ one-way ══════► │ LocalSegment seg     │
- │  ctx.connect(0, key) │  write / store /  │  seg.data()  ← reads │
- │ c.write(off, buf)    │  notify / flush   │  seg.wait_event(ev)  │
- └──────────────────────┘                   └──────────────────────┘
+
+The same ping-pong program (`examples/pingpong.cpp`: an 8-byte store and a
+spin on local memory, then 1 MiB writes), with only the config changed:
+
+| Backend | Round trip (median) | 1 MiB writes | Setup |
+|---|---|---|---|
+| `shm` | 0.16 µs | 26 GB/s | two processes, one machine |
+| `ntb` | 0.16 µs | 2.7 GB/s | two VMs on a virtual NTB ([qemu-ntb](https://github.com/oguzhankynk/qemu-ntb), fast windows) |
+| `tcp` | 34 µs | 6 GB/s | two processes, loopback |
+
+One laptop (i3-12100F); orders of magnitude, not a benchmark. Over NTB
+between two VMs the "link" is shared memory, so real NTB hardware adds its
+PCIe latency.
+
+## Getting it
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(pushseg
+  GIT_REPOSITORY https://github.com/oguzhankynk/pushseg.git
+  GIT_TAG v0.3.0)
+FetchContent_MakeAvailable(pushseg)
+target_link_libraries(myapp PRIVATE pushseg::pushseg)
 ```
+
+Or install it (`cmake --install`) and use `find_package(pushseg)`.
 
 ## Concepts
 
@@ -158,7 +190,7 @@ processes    = 1             # pushseg processes per node on this link (1 to 16)
   `lock_dir` (default `/tmp`); a process beyond that fails with `kExists`. Set the
   same value on both nodes, and load `ntb_seg` with the same `seg_size` on both.
   More than one needs as many doorbells and an `ntb_seg` that gives every open
-  file every event (ntb-lab after 2026-11-28).
+  file every event (ntb-lab v0.1.0 or later).
 - On a window that is trapped MMIO rather than mapped memory (qemu-ntb without
   `fast-mw`, or `ntbd`), set `dma_threshold = 0`: `memcpy` into trapped MMIO does not
   work there, DMA does.
@@ -234,7 +266,8 @@ src/core/
 src/backends/
   tcp.cpp         Built-in stream backend (TCP)
   shm.cpp         Built-in mapped backend (POSIX shared memory, same host)
-  posix_common.hpp  Identity lock and helpers for shm; TSan annotations for shm and tcp
+  ntb.cpp         Built-in mapped backend (PCIe NTB through ntb_seg)
+  posix_common.hpp  Identity lock and helpers for shm and ntb; TSan annotations for shm and tcp
   loopmem.cpp     Built-in mapped backend (in-process; reference and tests)
 tests/unit/       Config, wire, API, and end-to-end contract tests
 examples/         pingpong + sample config
@@ -248,6 +281,14 @@ examples/         pingpong + sample config
 - No remote read-modify-write atomics (`fetch_add`, CAS). Use one slot per writer for multi-writer counters.
 - No exclusive (single-writer) segment flag yet.
 
+## Related projects
+
+| Project | What it is |
+|---|---|
+| [gridlane](https://github.com/oguzhankynk/gridlane) | Layered data distribution for parallel programs, built on pushseg |
+| [ntb-lab](https://github.com/oguzhankynk/ntb-lab) | `ntb_seg`, the kernel module under the `ntb` backend; tests pushseg between two VMs |
+| [qemu-ntb](https://github.com/oguzhankynk/qemu-ntb) | A virtual PCIe NTB for QEMU, to run the `ntb` backend without hardware |
+
 ## License
 
-MIT, see `LICENSE`.
+MIT, see [`LICENSE`](LICENSE).
